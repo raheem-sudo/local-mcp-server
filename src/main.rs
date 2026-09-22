@@ -24,9 +24,10 @@ use rmcp::{
     handler::server::tool::ToolRouter,
     model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
-    transport::sse_server::SseServer,
+    transport::sse_server::{SseServer, SseServerConfig},
 };
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// Example MCP "server": holds whatever state your tools need.
 /// Here it's just a shared counter.
@@ -96,19 +97,47 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Bind 0.0.0.0 so the same binary works for a purely local run
-    // (reach it at http://localhost:8080/sse) or, behind a reverse proxy /
-    // tunnel, as a remote server (reach it at https://your-host/sse).
-    let bind_addr = "0.0.0.0:8080".parse()?;
+    // Render (and most PaaS hosts) assign a port dynamically via $PORT and
+    // require the service to bind 0.0.0.0. Locally, PORT is usually unset,
+    // so we fall back to 8080 to match the earlier local instructions.
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse()?;
 
-    // SseServer::serve() starts listening immediately and defaults to
-    // exposing the SSE stream at "/sse" and the message-post endpoint at
-    // "/message" — matching the URL in your config.
-    let sse_server = SseServer::serve(bind_addr).await?;
+    let sse_config = SseServerConfig {
+        bind: bind_addr,
+        sse_path: "/sse".to_string(),
+        post_path: "/message".to_string(),
+        ct: CancellationToken::new(),
+        sse_keep_alive: None,
+    };
 
-    // Attach our service: a new `Counter` instance is created per client
-    // session. `with_service` returns a CancellationToken you can use for
-    // graceful shutdown.
+    // SseServer::new() gives us the raw axum Router instead of binding
+    // and serving immediately, so we can merge in extra routes — here, a
+    // plain GET /healthz that Render's health checker can hit. (The /sse
+    // route itself is a permanently-open stream, which is a poor fit for
+    // a health check.)
+    let (sse_server, sse_router) = SseServer::new(sse_config);
+    let router = sse_router.route(
+        "/healthz",
+        axum::routing::get(|| async { "ok" }),
+    );
+
+    let listener = tokio::net::TcpListener::bind(sse_server.config.bind).await?;
+    let ct = sse_server.config.ct.child_token();
+    let axum_server =
+        axum::serve(listener, router).with_graceful_shutdown(async move { ct.cancelled().await });
+
+    tokio::spawn(async move {
+        if let Err(e) = axum_server.await {
+            tracing::error!("HTTP server error: {e}");
+        }
+    });
+
+    // Attach our MCP service: a new `Counter` instance is created per
+    // client session.
     let ct = sse_server.with_service(Counter::new);
 
     tracing::info!("MCP SSE server listening on http://{bind_addr}/sse");
