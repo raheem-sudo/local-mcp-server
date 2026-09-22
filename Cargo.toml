@@ -9,8 +9,10 @@ rust-version = "1.75"
 # "transport-sse-server" gives you the Server-Sent-Events HTTP transport
 # (the one your JSON config with "type": "sse" expects).
 rmcp = { version = "0.8", features = ["server", "transport-sse-server"] }
+axum = "0.8"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = "0.7"
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
